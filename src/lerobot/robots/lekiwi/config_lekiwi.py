@@ -20,6 +20,18 @@ from lerobot.cameras.opencv import OpenCVCameraConfig
 from ..config import RobotConfig
 
 
+LEKIWI_BASE_MOTOR_NAMES = (
+    "base_front_left_wheel",
+    "base_front_right_wheel",
+    "base_rear_left_wheel",
+    "base_rear_right_wheel",
+)
+
+
+def lekiwi_base_wheel_velocity_signs_config() -> dict[str, int]:
+    return dict.fromkeys(LEKIWI_BASE_MOTOR_NAMES, 1)
+
+
 def lekiwi_cameras_config() -> dict[str, CameraConfig]:
     return {
         "front": OpenCVCameraConfig(
@@ -44,6 +56,21 @@ class LeKiwiConfig(RobotConfig):
     max_relative_target: float | dict[str, float] | None = None
 
     cameras: dict[str, CameraConfig] = field(default_factory=lekiwi_cameras_config)
+
+    # Four mecanum wheels in top-view X layout.
+    # Wheel IDs are 7..10 in front-left, front-right, rear-left, rear-right order.
+    base_wheel_radius_m: float = 0.05
+    base_lateral_wheelbase_m: float = 0.15
+    base_longitudinal_wheelbase_m: float = 0.12
+    base_max_raw_wheel_speed: int = 3000
+
+    # Use -1 for any wheel whose positive motor velocity is opposite to the kinematic convention.
+    base_wheel_velocity_signs: dict[str, int] = field(
+        default_factory=lekiwi_base_wheel_velocity_signs_config
+    )
+
+    # Select which LeKiwi motors are configured by lerobot-setup-motors.
+    setup_motors: str = "all"
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = True

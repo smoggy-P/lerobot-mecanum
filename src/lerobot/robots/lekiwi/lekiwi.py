@@ -18,7 +18,6 @@ import logging
 import time
 from functools import cached_property
 from itertools import chain
-from typing import Any
 
 import numpy as np
 
@@ -33,14 +32,14 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
-from .config_lekiwi import LeKiwiConfig
+from .config_lekiwi import LEKIWI_BASE_MOTOR_NAMES, LeKiwiConfig
 
 logger = logging.getLogger(__name__)
 
 
 class LeKiwi(Robot):
     """
-    The robot includes a three omniwheel mobile base and a remote follower arm.
+    The robot includes a four-wheel mecanum mobile base and a remote follower arm.
     The leader arm is connected locally (on the laptop) and its joint positions are recorded and then
     forwarded to the remote follower arm (after applying a safety clamp).
     In parallel, keyboard teleoperation is used to generate raw velocity commands for the wheels.
@@ -64,15 +63,29 @@ class LeKiwi(Robot):
                 "arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
                 "arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
                 # base
-                "base_left_wheel": Motor(7, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_back_wheel": Motor(8, "sts3215", MotorNormMode.RANGE_M100_100),
-                "base_right_wheel": Motor(9, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_front_left_wheel": Motor(7, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_front_right_wheel": Motor(8, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_rear_left_wheel": Motor(9, "sts3215", MotorNormMode.RANGE_M100_100),
+                "base_rear_right_wheel": Motor(10, "sts3215", MotorNormMode.RANGE_M100_100),
             },
             calibration=self.calibration,
         )
         self.arm_motors = [motor for motor in self.bus.motors if motor.startswith("arm")]
         self.base_motors = [motor for motor in self.bus.motors if motor.startswith("base")]
+        self._validate_base_wheel_velocity_signs()
         self.cameras = make_cameras_from_configs(config.cameras)
+
+    def _validate_base_wheel_velocity_signs(self) -> None:
+        wheel_signs = self.config.base_wheel_velocity_signs
+        missing = set(self.base_motors) - set(wheel_signs)
+        unknown = set(wheel_signs) - set(self.base_motors)
+        invalid = {name: sign for name, sign in wheel_signs.items() if sign not in {-1, 1}}
+
+        if missing or unknown or invalid:
+            raise ValueError(
+                "base_wheel_velocity_signs must contain exactly one -1 or 1 entry for each base motor. "
+                f"Missing={sorted(missing)}, unknown={sorted(unknown)}, invalid={invalid}."
+            )
 
     @property
     def _state_ft(self) -> dict[str, type]:
@@ -199,7 +212,16 @@ class LeKiwi(Robot):
         self.bus.enable_torque()
 
     def setup_motors(self) -> None:
-        for motor in chain(reversed(self.arm_motors), reversed(self.base_motors)):
+        if self.config.setup_motors == "all":
+            motors = chain(reversed(self.arm_motors), reversed(self.base_motors))
+        elif self.config.setup_motors == "arm":
+            motors = reversed(self.arm_motors)
+        elif self.config.setup_motors == "base":
+            motors = reversed(self.base_motors)
+        else:
+            raise ValueError(f"Unknown setup_motors option: {self.config.setup_motors}")
+
+        for motor in motors:
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
@@ -223,118 +245,155 @@ class LeKiwi(Robot):
         degps = magnitude / steps_per_deg
         return degps
 
+    @staticmethod
+    def _mecanum_kinematics_matrix(lateral_wheelbase: float, longitudinal_wheelbase: float) -> np.ndarray:
+        rotation_lever = (lateral_wheelbase + longitudinal_wheelbase) / 2.0
+        return np.array(
+            [
+                [1.0, -1.0, -rotation_lever],
+                [1.0, 1.0, rotation_lever],
+                [1.0, 1.0, -rotation_lever],
+                [1.0, -1.0, rotation_lever],
+            ]
+        )
+
+    def _base_wheel_velocity_sign_array(self, wheel_signs: dict[str, int] | None = None) -> np.ndarray:
+        wheel_signs = self.config.base_wheel_velocity_signs if wheel_signs is None else wheel_signs
+        return np.array([wheel_signs[name] for name in LEKIWI_BASE_MOTOR_NAMES], dtype=float)
+
     def _body_to_wheel_raw(
         self,
         x: float,
         y: float,
         theta: float,
-        wheel_radius: float = 0.05,
-        base_radius: float = 0.125,
-        max_raw: int = 3000,
-    ) -> dict:
+        wheel_radius: float | None = None,
+        lateral_wheelbase: float | None = None,
+        longitudinal_wheelbase: float | None = None,
+        max_raw: int | None = None,
+        wheel_signs: dict[str, int] | None = None,
+    ) -> dict[str, int]:
         """
-        Convert desired body-frame velocities into wheel raw commands.
+        Convert desired body-frame velocities into four mecanum wheel raw commands.
 
         Parameters:
-          x_cmd      : Linear velocity in x (m/s).
-          y_cmd      : Linear velocity in y (m/s).
-          theta_cmd  : Rotational velocity (deg/s).
+          x          : Linear velocity in x (m/s). Positive is forward.
+          y          : Linear velocity in y (m/s). Positive is left.
+          theta      : Rotational velocity (deg/s). Positive is counter-clockwise.
           wheel_radius: Radius of each wheel (meters).
-          base_radius : Distance from the center of rotation to each wheel (meters).
+          lateral_wheelbase: Left-right distance between wheel centers (meters).
+          longitudinal_wheelbase: Front-rear distance between wheel centers (meters).
           max_raw    : Maximum allowed raw command (ticks) per wheel.
 
         Returns:
           A dictionary with wheel raw commands:
-             {"base_left_wheel": value, "base_back_wheel": value, "base_right_wheel": value}.
+             {
+                 "base_front_left_wheel": value,
+                 "base_front_right_wheel": value,
+                 "base_rear_left_wheel": value,
+                 "base_rear_right_wheel": value,
+             }.
 
         Notes:
-          - Internally, the method converts theta_cmd to rad/s for the kinematics.
+          - Internally, the method converts theta to rad/s for the kinematics.
+          - The mecanum rollers are assumed to be in top-view X layout.
           - The raw command is computed from the wheels angular speed in deg/s
             using _degps_to_raw(). If any command exceeds max_raw, all commands
             are scaled down proportionally.
         """
-        # Convert rotational velocity from deg/s to rad/s.
+        wheel_radius = self.config.base_wheel_radius_m if wheel_radius is None else wheel_radius
+        lateral_wheelbase = (
+            self.config.base_lateral_wheelbase_m if lateral_wheelbase is None else lateral_wheelbase
+        )
+        longitudinal_wheelbase = (
+            self.config.base_longitudinal_wheelbase_m
+            if longitudinal_wheelbase is None
+            else longitudinal_wheelbase
+        )
+        max_raw = self.config.base_max_raw_wheel_speed if max_raw is None else max_raw
+
+        if wheel_radius <= 0 or lateral_wheelbase <= 0 or longitudinal_wheelbase <= 0 or max_raw <= 0:
+            raise ValueError("Wheel radius, wheelbase dimensions, and max_raw must be positive.")
+
         theta_rad = theta * (np.pi / 180.0)
-        # Create the body velocity vector [x, y, theta_rad].
         velocity_vector = np.array([x, y, theta_rad])
+        m = self._mecanum_kinematics_matrix(lateral_wheelbase, longitudinal_wheelbase)
 
-        # Define the wheel mounting angles with a -90° offset.
-        angles = np.radians(np.array([240, 0, 120]) - 90)
-        # Build the kinematic matrix: each row maps body velocities to a wheel’s linear speed.
-        # The third column (base_radius) accounts for the effect of rotation.
-        m = np.array([[np.cos(a), np.sin(a), base_radius] for a in angles])
-
-        # Compute each wheel’s linear speed (m/s) and then its angular speed (rad/s).
         wheel_linear_speeds = m.dot(velocity_vector)
         wheel_angular_speeds = wheel_linear_speeds / wheel_radius
-
-        # Convert wheel angular speeds from rad/s to deg/s.
         wheel_degps = wheel_angular_speeds * (180.0 / np.pi)
 
-        # Scaling
         steps_per_deg = 4096.0 / 360.0
-        raw_floats = [abs(degps) * steps_per_deg for degps in wheel_degps]
-        max_raw_computed = max(raw_floats)
+        raw_floats = np.abs(wheel_degps) * steps_per_deg
+        max_raw_computed = float(np.max(raw_floats))
         if max_raw_computed > max_raw:
             scale = max_raw / max_raw_computed
             wheel_degps = wheel_degps * scale
 
-        # Convert each wheel’s angular speed (deg/s) to a raw integer.
-        wheel_raw = [self._degps_to_raw(deg) for deg in wheel_degps]
+        wheel_raw = np.array([self._degps_to_raw(deg) for deg in wheel_degps], dtype=int)
+        wheel_raw = wheel_raw * self._base_wheel_velocity_sign_array(wheel_signs).astype(int)
 
-        return {
-            "base_left_wheel": wheel_raw[0],
-            "base_back_wheel": wheel_raw[1],
-            "base_right_wheel": wheel_raw[2],
-        }
+        return {name: int(raw) for name, raw in zip(LEKIWI_BASE_MOTOR_NAMES, wheel_raw, strict=True)}
 
     def _wheel_raw_to_body(
         self,
-        left_wheel_speed,
-        back_wheel_speed,
-        right_wheel_speed,
-        wheel_radius: float = 0.05,
-        base_radius: float = 0.125,
-    ) -> dict[str, Any]:
+        front_left_wheel_speed,
+        front_right_wheel_speed,
+        rear_left_wheel_speed,
+        rear_right_wheel_speed,
+        wheel_radius: float | None = None,
+        lateral_wheelbase: float | None = None,
+        longitudinal_wheelbase: float | None = None,
+        wheel_signs: dict[str, int] | None = None,
+    ) -> dict[str, float]:
         """
-        Convert wheel raw command feedback back into body-frame velocities.
+        Convert four mecanum wheel raw feedback back into body-frame velocities.
 
         Parameters:
-          wheel_raw   : Vector with raw wheel commands ("base_left_wheel", "base_back_wheel", "base_right_wheel").
+          wheel_raw   : Vector with raw wheel commands, in front-left, front-right, rear-left, rear-right order.
           wheel_radius: Radius of each wheel (meters).
-          base_radius : Distance from the robot center to each wheel (meters).
+          lateral_wheelbase: Left-right distance between wheel centers (meters).
+          longitudinal_wheelbase: Front-rear distance between wheel centers (meters).
 
         Returns:
           A dict (x.vel, y.vel, theta.vel) all in m/s
         """
-
-        # Convert each raw command back to an angular speed in deg/s.
-        wheel_degps = np.array(
-            [
-                self._raw_to_degps(left_wheel_speed),
-                self._raw_to_degps(back_wheel_speed),
-                self._raw_to_degps(right_wheel_speed),
-            ]
+        wheel_radius = self.config.base_wheel_radius_m if wheel_radius is None else wheel_radius
+        lateral_wheelbase = (
+            self.config.base_lateral_wheelbase_m if lateral_wheelbase is None else lateral_wheelbase
+        )
+        longitudinal_wheelbase = (
+            self.config.base_longitudinal_wheelbase_m
+            if longitudinal_wheelbase is None
+            else longitudinal_wheelbase
         )
 
-        # Convert from deg/s to rad/s.
+        if wheel_radius <= 0 or lateral_wheelbase <= 0 or longitudinal_wheelbase <= 0:
+            raise ValueError("Wheel radius and wheelbase dimensions must be positive.")
+
+        wheel_raw = np.array(
+            [
+                front_left_wheel_speed,
+                front_right_wheel_speed,
+                rear_left_wheel_speed,
+                rear_right_wheel_speed,
+            ],
+            dtype=float,
+        )
+        wheel_raw = wheel_raw * self._base_wheel_velocity_sign_array(wheel_signs)
+
+        wheel_degps = np.array([self._raw_to_degps(raw_speed) for raw_speed in wheel_raw])
         wheel_radps = wheel_degps * (np.pi / 180.0)
-        # Compute each wheel’s linear speed (m/s) from its angular speed.
         wheel_linear_speeds = wheel_radps * wheel_radius
 
-        # Define the wheel mounting angles with a -90° offset.
-        angles = np.radians(np.array([240, 0, 120]) - 90)
-        m = np.array([[np.cos(a), np.sin(a), base_radius] for a in angles])
-
-        # Solve the inverse kinematics: body_velocity = M⁻¹ · wheel_linear_speeds.
-        m_inv = np.linalg.inv(m)
-        velocity_vector = m_inv.dot(wheel_linear_speeds)
+        m = self._mecanum_kinematics_matrix(lateral_wheelbase, longitudinal_wheelbase)
+        velocity_vector = np.linalg.pinv(m).dot(wheel_linear_speeds)
         x, y, theta_rad = velocity_vector
         theta = theta_rad * (180.0 / np.pi)
+
         return {
-            "x.vel": x,
-            "y.vel": y,
-            "theta.vel": theta,
+            "x.vel": float(x),
+            "y.vel": float(y),
+            "theta.vel": float(theta),
         }  # m/s and deg/s
 
     @check_if_not_connected
@@ -345,9 +404,10 @@ class LeKiwi(Robot):
         base_wheel_vel = self.bus.sync_read("Present_Velocity", self.base_motors)
 
         base_vel = self._wheel_raw_to_body(
-            base_wheel_vel["base_left_wheel"],
-            base_wheel_vel["base_back_wheel"],
-            base_wheel_vel["base_right_wheel"],
+            base_wheel_vel["base_front_left_wheel"],
+            base_wheel_vel["base_front_right_wheel"],
+            base_wheel_vel["base_rear_left_wheel"],
+            base_wheel_vel["base_rear_right_wheel"],
         )
 
         arm_state = {f"{k}.pos": v for k, v in arm_pos.items()}
